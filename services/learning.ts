@@ -74,9 +74,30 @@ export function pickStyle(scores: StyleScores, epsilon = 0.25): Style {
 }
 
 export function updateStyleScore(scores: StyleScores, style: Style, rating: Rating): StyleScores {
+    return updateStyleReward(scores, style, REWARD[rating]);
+}
+
+// Moving average; never slower than 5% so old opinions can still change.
+export function updateStyleReward(scores: StyleScores, style: Style, reward: number): StyleScores {
     const key = styleKey(style);
     const prev = scores[key] ?? { score: 0.5, tries: 0 };
     const tries = prev.tries + 1;
-    const score = prev.score + (REWARD[rating] - prev.score) / tries;
+    const score = prev.score + (reward - prev.score) * Math.max(1 / tries, 0.05);
     return { ...scores, [key]: { score, tries } };
+}
+
+// Self-learning: pull each cell toward the average of the elite patterns,
+// then decay slightly toward 0.5 so the model never freezes on one pattern.
+export function learnFromElites(model: Grid, elites: Grid[], rate = 0.1, decay = 0.005): Grid {
+    if (!elites.length) return model;
+    return model.map((row, y) =>
+        row.map((p, x) => {
+            let mean = 0;
+            for (const e of elites) mean += e[y][x];
+            mean /= elites.length;
+            let next = p + rate * (mean - p);
+            next += decay * (0.5 - next);
+            return Math.round(Math.min(MAX_P, Math.max(MIN_P, next)) * 1000) / 1000;
+        })
+    );
 }
