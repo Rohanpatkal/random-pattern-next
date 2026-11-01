@@ -1,54 +1,82 @@
-export function learningAndMasterConvertion(masterArray: number[][], curruntArray: number[][], feedback: number = 5): number[][] {
-    //update master array and return;
+import { Grid, SMOOTHING_LEVELS, SYMMETRIES, Style } from "./array";
 
-    //loop perpixel and perPixel call compare;
+export type Rating = "good" | "avg" | "bad";
 
-    let mArray: number[][] = [];
-
-    for (let y = 0; y < masterArray.length; y++) {
-        mArray[y] = []
-        for (let x = 0; x < masterArray[y].length; x++) {
-            mArray[y][x] = compareAndReturnForPixel(masterArray[y][x], curruntArray[y][x], feedback)
-        }
-    }
-
-    console.log("new master array", mArray);
-
-    return mArray;
+export interface StyleScore {
+    score: number; // running average reward, 0..1
+    tries: number;
 }
 
-function compareAndReturnForPixel(pixM: number, pixA: number, feedback: number): number {
-    let levels = {
-        "good": 7,
-        "avrage": 5,
-        "bad": 3
-    }
-    
-    let tempM = 5;
-    if (feedback > 5) { //good +2
-        if (pixA) {
-            if (pixM < 9) {
-                tempM = pixM + 1;
-            }
-        } else {
-            if (pixM > 2) {
-                tempM = pixM - 1;
-            }
-        }
-    } else if (feedback < 5) { //bad -2
-        if (pixA) {
-            if (pixM > 2) {
-                tempM = pixM - 1;
-            }
-        } else {
-            if (pixM < 9) {
-                tempM = pixM + 1;
-            }
-        }
-    } else {    //avg 5
-        tempM = pixM;
-    }
-    // feedback //9 , 5 , 2   
+export type StyleScores = Record<string, StyleScore>;
 
-    return tempM; //learn value 9, 7, 5, 3 , 2
+const MIN_P = 0.05;
+const MAX_P = 0.95;
+
+// How strongly each rating moves the model.
+const LEARNING_RATE: Record<Rating, number> = { good: 0.15, avg: 0.03, bad: 0.1 };
+const REWARD: Record<Rating, number> = { good: 1, avg: 0.5, bad: 0 };
+
+// Good/avg pull each cell's probability toward what was shown; bad pushes it away.
+export function learnFromRating(model: Grid, pattern: Grid, rating: Rating): Grid {
+    const rate = LEARNING_RATE[rating];
+    return model.map((row, y) =>
+        row.map((p, x) => {
+            const shown = pattern[y][x];
+            const target = rating === "bad" ? 1 - shown : shown;
+            const next = p + rate * (target - p);
+            return Math.round(Math.min(MAX_P, Math.max(MIN_P, next)) * 1000) / 1000;
+        })
+    );
+}
+
+// 0 = still random, 1 = fully decided on every cell.
+export function confidence(model: Grid): number {
+    let total = 0;
+    let count = 0;
+    for (const row of model) {
+        for (const p of row) {
+            total += Math.abs(p - 0.5) * 2;
+            count++;
+        }
+    }
+    return count ? total / count : 0;
+}
+
+export function styleKey(style: Style): string {
+    return `${style.symmetry}-${style.smoothing}`;
+}
+
+export function allStyles(): Style[] {
+    return SYMMETRIES.flatMap((symmetry) => SMOOTHING_LEVELS.map((smoothing) => ({ symmetry, smoothing })));
+}
+
+export function bestStyle(scores: StyleScores): Style | null {
+    let best: Style | null = null;
+    let bestScore = -1;
+    for (const style of allStyles()) {
+        const s = scores[styleKey(style)];
+        if (s && s.score > bestScore) {
+            best = style;
+            bestScore = s.score;
+        }
+    }
+    return best;
+}
+
+// Epsilon-greedy: usually pick the best-rated style, sometimes explore a new one.
+export function pickStyle(scores: StyleScores, epsilon = 0.25): Style {
+    const styles = allStyles();
+    const untried = styles.filter((s) => !scores[styleKey(s)]);
+    if (untried.length && Math.random() < 0.5) return untried[Math.floor(Math.random() * untried.length)];
+    const best = bestStyle(scores);
+    if (!best || Math.random() < epsilon) return styles[Math.floor(Math.random() * styles.length)];
+    return best;
+}
+
+export function updateStyleScore(scores: StyleScores, style: Style, rating: Rating): StyleScores {
+    const key = styleKey(style);
+    const prev = scores[key] ?? { score: 0.5, tries: 0 };
+    const tries = prev.tries + 1;
+    const score = prev.score + (REWARD[rating] - prev.score) / tries;
+    return { ...scores, [key]: { score, tries } };
 }

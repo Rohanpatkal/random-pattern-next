@@ -1,46 +1,49 @@
-import { genarateArray } from "./array"
-import { learningAndMasterConvertion } from "./learning"
+import { createGrid, Grid } from "./array";
+import { Rating, StyleScores } from "./learning";
 
-export function genarateRandome(value: number): number | undefined {
-    if (value == 2) {
-        return Math.round(Math.random());
-    } else if (value == 10) {
-        return Math.floor(Math.random() * 10) + 1;
-    }
+const STORAGE_KEY = "pattern-learner:v2";
+
+export interface LearnerState {
+    models: Record<string, Grid>; // one probability model per grid size
+    styleScores: StyleScores;
+    generations: number;
+    ratings: Record<Rating, number>;
 }
 
-export function genarateRandome2DArray(hight: number, width: number): number[][] {
-    let a: number[][] = [];
-    for (let i = 0; i < hight; i++) {
-        a[i] = [];
-        for (let j = 0; j < width; j++) {
-            a[i][j] = genarateRandome(10) ?? 0;
-        }
-    }
-    return a;
+export function emptyState(): LearnerState {
+    return { models: {}, styleScores: {}, generations: 0, ratings: { good: 0, avg: 0, bad: 0 } };
 }
 
-export function convertIntoMasterArray(hight: number, width: number, curruntArray: number[][], feedback: number): number[][] {
-    let masterArray: number[][] | null = null;
+export function loadState(): LearnerState {
     try {
-        masterArray = JSON.parse(window.localStorage.getItem("masterArray") ?? "null");
-    } catch (e) { masterArray = null; }
-
-    if (!masterArray) {
-        console.log("array not found in local");
-        masterArray = genarateRandome2DArray(hight, width)
-        window.localStorage.setItem("masterArray", JSON.stringify(masterArray))
+        const raw = window.localStorage.getItem(STORAGE_KEY);
+        if (raw) return { ...emptyState(), ...JSON.parse(raw) };
+    } catch {
+        // Corrupt or blocked storage: start fresh.
     }
+    return emptyState();
+}
 
-    // console.log("aaaaaaaaaaaaaaaaaaaaaaaa", masterArray);
-    if (curruntArray && curruntArray.length === masterArray.length) {
-        masterArray = learningAndMasterConvertion(masterArray, curruntArray, feedback);
-        window.localStorage.setItem("masterArray", JSON.stringify(masterArray))
+export function saveState(state: LearnerState): void {
+    try {
+        window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    } catch {
+        // Storage full or blocked: keep learning in memory only.
     }
+}
 
-    console.log("bbbbbbbbbbbbbbbbbbbbbbbbb", masterArray);
+export function resetState(): LearnerState {
+    try {
+        window.localStorage.removeItem(STORAGE_KEY);
+        window.localStorage.removeItem("masterArray"); // old v1 data
+    } catch {}
+    return emptyState();
+}
 
-    let array = genarateArray(masterArray, genarateRandome);
+export function modelKey(rows: number, cols: number): string {
+    return `${rows}x${cols}`;
+}
 
-    return array;
+export function getModel(state: LearnerState, rows: number, cols: number): Grid {
+    return state.models[modelKey(rows, cols)] ?? createGrid(rows, cols, 0.5);
 }
