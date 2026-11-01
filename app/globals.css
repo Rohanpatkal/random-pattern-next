@@ -343,3 +343,37 @@ label {
         overflow: visible;
     }
 }
+
+.chart-coverage { stroke: var(--green); stroke-dasharray: 4 3; }
+.legend-coverage { color: var(--green); }
+
+/* Elites gallery */
+.gallery-wrap {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    grid-template-rows: 1fr auto;
+    gap: 4px;
+}
+
+.gallery {
+    width: 100%;
+    aspect-ratio: 1;
+    border-radius: 6px;
+    cursor: pointer;
+    image-rendering: pixelated;
+}
+
+.axis {
+    font-size: 11px;
+    color: var(--muted);
+}
+
+.axis-y {
+    writing-mode: vertical-rl;
+    text-align: center;
+}
+
+.axis-x {
+    grid-column: 2;
+    text-align: right;
+}

@@ -1,58 +1,76 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { generatePattern, Grid, Style } from "../services/array";
-import { evolveStep } from "../services/evolve";
-import { bestStyle, confidence, learnFromRating, pickStyle, Rating, updateStyleScore } from "../services/learning";
-import { adjustWeights, Measure, MEASURES, measure, Measures, totalScore } from "../services/scoring";
+import { archiveStats, BINS, Elite, evaluate, NICHES } from "../services/elites";
+import { describeGenome, Genome, mutateGenome, Pattern, randomGenome, renderGenome } from "../services/genome";
+import { adjustWeights, Measure, MEASURES } from "../services/scoring";
 import {
-    getArchive, getModel, LearnerState, loadState, modelKey, resetState, saveState, SCORE_HISTORY_LENGTH, ScorePoint,
+    FAVOURITES_LENGTH, LearnerState, loadState, Rating, resetState, saveState, SCORE_HISTORY_LENGTH, ScorePoint, sizeKey,
 } from "../services/service";
+import type { EvolveRequest, EvolveResponse } from "../workers/evolve.worker";
 import configValues from "../config.json";
 
 const { height, width, defaultCellSize, historyLength } = configValues;
 
 const INK = "#0D1B2A";
 const PAPER = "#FFFFFF";
-const EVOLVE_BATCH = 50;
+const EMPTY = "#F5F8FC";
+const EVOLVE_ROUNDS = 50;
+const BATCH = 24; // patterns tried per round
 const SAVE_EVERY = 10;
+const GALLERY_TILE = 40; // px per niche in the gallery
+const GALLERY_SIZE = GALLERY_TILE * BINS;
 
 interface HistoryItem {
     src: string;
     rating: Rating;
 }
 
-function describeStyle(style: Style | null): string {
-    if (!style) return "not learned yet";
-    return `${style.symmetry} · smooth ${style.smoothing}`;
+interface Shown {
+    elite: Elite;
+    niche: number | null; // archive slot it came from, if any
 }
 
 function ScoreChart({ points }: { points: ScorePoint[] }) {
     if (points.length < 2) return <p className="hint">Run evolution to see the score chart.</p>;
     const w = 300;
-    const h = 80;
+    const h = 64;
     const line = (key: keyof ScorePoint) =>
         points.map((p, i) => `${(i / (points.length - 1)) * w},${h - p[key] * h}`).join(" ");
     return (
         <svg className="chart" viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" role="img"
-            aria-label="Best and average score per generation">
-            <polyline points={line("avg")} className="chart-avg" />
+            aria-label="Best score, mean score and coverage per round">
+            <polyline points={line("coverage")} className="chart-coverage" />
+            <polyline points={line("mean")} className="chart-avg" />
             <polyline points={line("best")} className="chart-best" />
         </svg>
     );
 }
 
+// Draws a pattern scaled to fit a w×h box at (ox, oy).
+function paint(ctx: CanvasRenderingContext2D, p: Pattern, ox: number, oy: number, w: number, h: number) {
+    const cw = w / p.cols;
+    const ch = h / p.rows;
+    ctx.fillStyle = PAPER;
+    ctx.fillRect(ox, oy, w, h);
+    ctx.fillStyle = INK;
+    for (let y = 0; y < p.rows; y++) {
+        for (let x = 0; x < p.cols; x++) {
+            if (p.data[y * p.cols + x]) ctx.fillRect(ox + x * cw, oy + y * ch, Math.ceil(cw), Math.ceil(ch));
+        }
+    }
+}
+
 export default function Home() {
     const canvasRef = useRef<HTMLCanvasElement>(null);
+    const galleryRef = useRef<HTMLCanvasElement>(null);
     const stateRef = useRef<LearnerState | null>(null);
-    const patternRef = useRef<Grid>([]);
-    const measuresRef = useRef<Measures | null>(null);
-    const remainingRef = useRef(0); // generations left to evolve; Infinity in auto mode
-    const frameRef = useRef<number | null>(null);
+    const workerRef = useRef<Worker | null>(null);
+    const remainingRef = useRef(0); // rounds left; Infinity in auto mode
+    const rescoreRef = useRef(false);
 
     const [cellSize, setCellSize] = useState<number>(defaultCellSize);
-    const [style, setStyle] = useState<Style | null>(null);
-    const [score, setScore] = useState<number | null>(null);
+    const [shown, setShown] = useState<Shown | null>(null);
     const [history, setHistory] = useState<HistoryItem[]>([]);
     const [running, setRunning] = useState<"off" | "batch" | "auto">("off");
     const [, forceRender] = useState(0);
@@ -60,96 +78,121 @@ export default function Home() {
     const rows = Math.ceil(height / cellSize);
     const cols = Math.ceil(width / cellSize);
     const state = stateRef.current;
+    const stats = state ? archiveStats(state.archive) : null;
 
-    function draw(pattern: Grid) {
+    function showElite(elite: Elite, niche: number | null) {
         const ctx = canvasRef.current?.getContext("2d");
-        if (!ctx) return;
-        ctx.fillStyle = PAPER;
-        ctx.fillRect(0, 0, width, height);
-        ctx.fillStyle = INK;
-        for (let y = 0; y < pattern.length; y++) {
-            for (let x = 0; x < pattern[y].length; x++) {
-                if (pattern[y][x]) ctx.fillRect(x * cellSize, y * cellSize, cellSize, cellSize);
+        if (ctx) paint(ctx, renderGenome(elite.genome, rows, cols), 0, 0, width, height);
+        setShown({ elite, niche });
+    }
+
+    function showGenome(genome: Genome) {
+        const s = stateRef.current;
+        if (!s) return;
+        showElite(evaluate(genome, s.weights, rows, cols).elite, null);
+    }
+
+    function drawGallery(niches: number[]) {
+        const ctx = galleryRef.current?.getContext("2d");
+        const s = stateRef.current;
+        if (!ctx || !s) return;
+        for (const i of niches) {
+            const ox = (i % BINS) * GALLERY_TILE;
+            const oy = Math.floor(i / BINS) * GALLERY_TILE;
+            const elite = s.archive[i];
+            if (elite) {
+                paint(ctx, renderGenome(elite.genome, rows, cols), ox, oy, GALLERY_TILE, GALLERY_TILE);
+            } else {
+                ctx.fillStyle = EMPTY;
+                ctx.fillRect(ox, oy, GALLERY_TILE, GALLERY_TILE);
             }
+            ctx.strokeStyle = PAPER;
+            ctx.strokeRect(ox + 0.5, oy + 0.5, GALLERY_TILE - 1, GALLERY_TILE - 1);
         }
     }
 
-    function show(pattern: Grid, shownStyle: Style, measures: Measures, shownScore: number) {
-        patternRef.current = pattern;
-        measuresRef.current = measures;
-        setStyle(shownStyle);
-        setScore(shownScore);
-        draw(pattern);
-    }
+    const allNiches = () => Array.from({ length: NICHES }, (_, i) => i);
 
-    function generate() {
+    function newPattern() {
         const s = stateRef.current;
         if (!s) return;
-        const nextStyle = pickStyle(s.styleScores);
-        const pattern = generatePattern(getModel(s, rows, cols), nextStyle);
-        const measures = measure(pattern, getArchive(s, rows, cols));
-        s.generations++;
-        saveState(s);
-        show(pattern, nextStyle, measures, totalScore(measures, s.weights));
-        forceRender((n) => n + 1);
+        const filled = s.archive.filter((e): e is Elite => e !== null);
+        showGenome(filled.length ? mutateGenome(filled[Math.floor(Math.random() * filled.length)].genome) : randomGenome());
     }
 
     function rate(rating: Rating) {
         const s = stateRef.current;
-        if (!s || !style || !patternRef.current.length || running !== "off") return;
+        if (!s || !shown || running !== "off") return;
+        const { elite, niche } = shown;
 
-        s.models[modelKey(rows, cols)] = learnFromRating(getModel(s, rows, cols), patternRef.current, rating);
-        s.styleScores = updateStyleScore(s.styleScores, style, rating);
-        if (measuresRef.current && rating !== "avg") {
-            s.weights = adjustWeights(s.weights, measuresRef.current, rating === "good" ? 1 : -1);
+        if (rating === "good") {
+            s.favourites = [elite.genome, ...s.favourites].slice(0, FAVOURITES_LENGTH);
+            s.weights = adjustWeights(s.weights, elite.measures, 1);
+            rescoreRef.current = true;
+        } else if (rating === "bad") {
+            s.weights = adjustWeights(s.weights, elite.measures, -1);
+            rescoreRef.current = true;
+            if (niche !== null && s.archive[niche] === elite) {
+                s.archive[niche] = null;
+                drawGallery([niche]);
+            }
         }
         s.ratings[rating]++;
+        saveState(s);
 
         const src = canvasRef.current?.toDataURL("image/png");
         if (src) setHistory((h) => [{ src, rating }, ...h].slice(0, historyLength));
 
-        generate();
+        newPattern();
+        forceRender((n) => n + 1);
     }
 
-    function evolveFrame() {
+    function requestRound() {
         const s = stateRef.current;
-        if (!s || remainingRef.current <= 0) {
-            stopEvolving();
-            return;
-        }
-        const key = modelKey(rows, cols);
-        s.evolveGenerations++;
-        const out = evolveStep({
-            model: getModel(s, rows, cols),
-            styleScores: s.styleScores,
+        const worker = workerRef.current;
+        if (!s || !worker) return;
+        const request: EvolveRequest = {
+            archive: s.archive,
             weights: s.weights,
-            archive: getArchive(s, rows, cols),
-            generation: s.evolveGenerations,
-        });
-        s.models[key] = out.model;
-        s.archives[key] = out.archive;
-        s.styleScores = out.styleScores;
-        s.scoreHistory = [...s.scoreHistory, { best: out.best.score, avg: out.avgScore }].slice(-SCORE_HISTORY_LENGTH);
-        if (s.evolveGenerations % SAVE_EVERY === 0) saveState(s);
+            favourites: s.favourites,
+            rows,
+            cols,
+            batch: BATCH,
+            rescore: rescoreRef.current || s.archiveSize !== sizeKey(rows, cols),
+        };
+        rescoreRef.current = false;
+        worker.postMessage(request);
+    }
 
-        show(out.best.pattern, out.best.style, out.best.measures, out.best.score);
+    function onRound(e: MessageEvent<EvolveResponse>) {
+        const s = stateRef.current;
+        if (!s) return;
+        s.archive = e.data.archive;
+        s.archiveSize = sizeKey(rows, cols);
+        s.batches++;
+        const st = archiveStats(s.archive);
+        s.scoreHistory = [...s.scoreHistory, { best: st.best?.score ?? 0, mean: st.mean, coverage: st.coverage }]
+            .slice(-SCORE_HISTORY_LENGTH);
+        if (s.batches % SAVE_EVERY === 0) saveState(s);
+
+        drawGallery(e.data.rescored ? allNiches() : e.data.changed);
+        const latest = e.data.changed[e.data.changed.length - 1];
+        if (latest !== undefined) showElite(s.archive[latest]!, latest);
         forceRender((n) => n + 1);
 
         remainingRef.current--;
-        frameRef.current = requestAnimationFrame(evolveFrame);
+        if (remainingRef.current > 0) requestRound();
+        else stopEvolving();
     }
 
     function startEvolving(mode: "batch" | "auto") {
-        if (frameRef.current !== null) cancelAnimationFrame(frameRef.current);
-        remainingRef.current = mode === "auto" ? Infinity : EVOLVE_BATCH;
+        remainingRef.current = mode === "auto" ? Infinity : EVOLVE_ROUNDS;
         setRunning(mode);
-        frameRef.current = requestAnimationFrame(evolveFrame);
+        requestRound();
     }
 
     function stopEvolving() {
-        if (frameRef.current !== null) cancelAnimationFrame(frameRef.current);
-        frameRef.current = null;
-        remainingRef.current = 0;
+        remainingRef.current = 0; // the round in flight finishes, then stops
         setRunning("off");
         if (stateRef.current) saveState(stateRef.current);
     }
@@ -158,6 +201,7 @@ export default function Home() {
         const s = stateRef.current;
         if (!s) return;
         s.weights = { ...s.weights, [m]: value };
+        rescoreRef.current = true;
         saveState(s);
         forceRender((n) => n + 1);
     }
@@ -167,19 +211,53 @@ export default function Home() {
         stopEvolving();
         stateRef.current = resetState();
         setHistory([]);
-        generate();
+        drawGallery(allNiches());
+        newPattern();
+        forceRender((n) => n + 1);
     }
+
+    function onGalleryClick(e: React.MouseEvent<HTMLCanvasElement>) {
+        const s = stateRef.current;
+        if (!s || running !== "off") return;
+        const rect = e.currentTarget.getBoundingClientRect();
+        const col = Math.floor(((e.clientX - rect.left) / rect.width) * BINS);
+        const row = Math.floor(((e.clientY - rect.top) / rect.height) * BINS);
+        const niche = row * BINS + col;
+        const elite = s.archive[niche];
+        if (elite) showElite(elite, niche);
+    }
+
+    function downloadPng() {
+        const src = canvasRef.current?.toDataURL("image/png");
+        if (!src) return;
+        const a = document.createElement("a");
+        a.href = src;
+        a.download = "pattern.png";
+        a.click();
+    }
+
+    // The worker is created once; its message handler is refreshed every render
+    // so it always sees the current cell size.
+    useEffect(() => {
+        const worker = new Worker(new URL("../workers/evolve.worker.ts", import.meta.url));
+        workerRef.current = worker;
+        return () => worker.terminate();
+    }, []);
+
+    useEffect(() => {
+        if (workerRef.current) workerRef.current.onmessage = onRound;
+    });
 
     useEffect(() => {
         if (!stateRef.current) stateRef.current = loadState();
         stopEvolving();
-        generate();
+        drawGallery(allNiches());
+        const best = archiveStats(stateRef.current.archive).best;
+        if (best) showGenome(best.genome);
+        else newPattern();
+        forceRender((n) => n + 1);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [cellSize]);
-
-    useEffect(() => () => {
-        if (frameRef.current !== null) cancelAnimationFrame(frameRef.current);
-    }, []);
 
     useEffect(() => {
         function onKey(e: KeyboardEvent) {
@@ -189,14 +267,13 @@ export default function Home() {
             else if (e.key === "3") rate("bad");
             else if (e.key === " ") {
                 e.preventDefault();
-                if (running === "off") generate();
+                if (running === "off") newPattern();
             }
         }
         window.addEventListener("keydown", onKey);
         return () => window.removeEventListener("keydown", onKey);
     });
 
-    const model = state ? getModel(state, rows, cols) : null;
     const busy = running !== "off";
 
     return (
@@ -204,7 +281,7 @@ export default function Home() {
             <section className="stage">
                 <header className="header">
                     <h1>Random Pattern Generator</h1>
-                    <p className="subtitle">Evolves patterns on its own. Rate them to steer its taste.</p>
+                    <p className="subtitle">Evolves pattern recipes on its own. Rate them to steer its taste.</p>
                 </header>
 
                 <div className="canvas-wrap">
@@ -213,14 +290,16 @@ export default function Home() {
 
                 <div className="stage-footer">
                     <p className="meta">
-                        Style: <strong>{describeStyle(style)}</strong>
-                        {score !== null && <> · Score: <strong>{Math.round(score * 100)}</strong></>}
+                        {shown ? <>
+                            <strong>{describeGenome(shown.elite.genome)}</strong> · Score: <strong>{Math.round(shown.elite.score * 100)}</strong>
+                        </> : "…"}
                     </p>
                     <div className="feedback">
                         <button className="chip good" disabled={busy} onClick={() => rate("good")}>good <kbd>1</kbd></button>
                         <button className="chip avg" disabled={busy} onClick={() => rate("avg")}>avg <kbd>2</kbd></button>
                         <button className="chip bad" disabled={busy} onClick={() => rate("bad")}>bad <kbd>3</kbd></button>
-                        <button className="chip" disabled={busy} onClick={generate}>new <kbd>Space</kbd></button>
+                        <button className="chip" disabled={busy} onClick={newPattern}>new <kbd>Space</kbd></button>
+                        <button className="chip" onClick={downloadPng}>PNG</button>
                     </div>
                 </div>
             </section>
@@ -230,22 +309,35 @@ export default function Home() {
                     <h2 className="section-title">Self-learning</h2>
                     <div className="evolve-buttons">
                         <button className="primary" disabled={busy} onClick={() => startEvolving("batch")}>
-                            {running === "batch" ? `Evolving… ${remainingRef.current}` : `Evolve ${EVOLVE_BATCH}`}
+                            {running === "batch" ? `Evolving… ${remainingRef.current}` : `Evolve ${EVOLVE_ROUNDS}`}
                         </button>
                         {running === "auto"
                             ? <button className="secondary" onClick={stopEvolving}>Stop</button>
                             : <button className="secondary" disabled={busy} onClick={() => startEvolving("auto")}>Auto</button>}
                     </div>
                     <ScoreChart points={state?.scoreHistory ?? []} />
-                    <p className="hint"><span className="legend-best">■</span> best <span className="legend-avg">■</span> average</p>
+                    <p className="hint">
+                        <span className="legend-best">■</span> best <span className="legend-avg">■</span> mean{" "}
+                        <span className="legend-coverage">■</span> coverage
+                    </p>
                 </section>
 
                 <section className="panel-section stats">
-                    <div><span>{state?.evolveGenerations ?? 0}</span>evolved</div>
-                    <div><span>{state ? `${state.ratings.good}/${state.ratings.avg}/${state.ratings.bad}` : "0/0/0"}</span>good/avg/bad</div>
-                    <div><span>{model ? Math.round(confidence(model) * 100) : 0}%</span>confidence</div>
+                    <div><span>{state?.batches ?? 0}</span>rounds</div>
+                    <div><span>{Math.round((stats?.coverage ?? 0) * 100)}%</span>coverage</div>
+                    <div><span>{Math.round((stats?.best?.score ?? 0) * 100)}</span>best score</div>
                 </section>
-                <p className="hint">Favourite style: <strong>{describeStyle(state ? bestStyle(state.styleScores) : null)}</strong></p>
+
+                <section className="panel-section">
+                    <h2 className="section-title">Elites gallery</h2>
+                    <div className="gallery-wrap">
+                        <span className="axis axis-y">darker ↓</span>
+                        <canvas ref={galleryRef} className="gallery" width={GALLERY_SIZE} height={GALLERY_SIZE}
+                            onClick={onGalleryClick} aria-label="Best pattern for each darkness and detail level" />
+                        <span className="axis axis-x">more detail →</span>
+                    </div>
+                    <p className="hint">Best pattern for each kind. Click one to view and rate it.</p>
+                </section>
 
                 <section className="panel-section">
                     <h2 className="section-title">Taste</h2>
@@ -268,6 +360,12 @@ export default function Home() {
                     </div>
                     <input type="range" id="numberRange" min="2" max="20" step="1" value={cellSize}
                         onChange={(e) => setCellSize(Number(e.target.value))} />
+                    <p className="hint">Recipes work at any size; the gallery is re-scored on the next round.</p>
+                </section>
+
+                <section className="panel-section stats">
+                    <div><span>{state ? `${state.ratings.good}/${state.ratings.avg}/${state.ratings.bad}` : "0/0/0"}</span>good/avg/bad</div>
+                    <div><span>{state?.favourites.length ?? 0}</span>favourites</div>
                 </section>
 
                 {history.length > 0 && (

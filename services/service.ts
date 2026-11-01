@@ -1,34 +1,37 @@
-import { createGrid, Grid } from "./array";
-import { Rating, StyleScores } from "./learning";
+import { Archive, emptyArchive, NICHES } from "./elites";
+import { Genome } from "./genome";
 import { DEFAULT_WEIGHTS, Weights } from "./scoring";
 
-const STORAGE_KEY = "pattern-learner:v2";
+export type Rating = "good" | "avg" | "bad";
+
+// v4 state is a few KB of genomes, so localStorage is enough (no IndexedDB needed).
+const STORAGE_KEY = "pattern-learner:v4";
 export const SCORE_HISTORY_LENGTH = 200;
+export const FAVOURITES_LENGTH = 10;
 
 export interface ScorePoint {
     best: number;
-    avg: number;
+    mean: number;
+    coverage: number;
 }
 
 export interface LearnerState {
-    models: Record<string, Grid>; // one probability model per grid size
-    archives: Record<string, Grid[]>; // recent top patterns per grid size, for novelty
-    styleScores: StyleScores;
+    archive: Archive;
+    archiveSize: string; // grid size the archive was scored at, e.g. "100x100"
     weights: Weights;
-    generations: number; // patterns shown to the user
-    evolveGenerations: number; // self-learning generations run
+    favourites: Genome[]; // genomes rated "good"; used more often as parents
+    batches: number;
     scoreHistory: ScorePoint[];
     ratings: Record<Rating, number>;
 }
 
 export function emptyState(): LearnerState {
     return {
-        models: {},
-        archives: {},
-        styleScores: {},
+        archive: emptyArchive(),
+        archiveSize: "",
         weights: { ...DEFAULT_WEIGHTS },
-        generations: 0,
-        evolveGenerations: 0,
+        favourites: [],
+        batches: 0,
         scoreHistory: [],
         ratings: { good: 0, avg: 0, bad: 0 },
     };
@@ -39,7 +42,9 @@ export function loadState(): LearnerState {
         const raw = window.localStorage.getItem(STORAGE_KEY);
         if (raw) {
             const saved = JSON.parse(raw);
-            return { ...emptyState(), ...saved, weights: { ...DEFAULT_WEIGHTS, ...saved.weights } };
+            const state: LearnerState = { ...emptyState(), ...saved, weights: { ...DEFAULT_WEIGHTS, ...saved.weights } };
+            if (state.archive.length !== NICHES) state.archive = emptyArchive();
+            return state;
         }
     } catch {
         // Corrupt or blocked storage: start fresh.
@@ -58,19 +63,12 @@ export function saveState(state: LearnerState): void {
 export function resetState(): LearnerState {
     try {
         window.localStorage.removeItem(STORAGE_KEY);
-        window.localStorage.removeItem("masterArray"); // old v1 data
+        window.localStorage.removeItem("pattern-learner:v2"); // 3.0 data
+        window.localStorage.removeItem("masterArray"); // 1.0 data
     } catch {}
     return emptyState();
 }
 
-export function modelKey(rows: number, cols: number): string {
+export function sizeKey(rows: number, cols: number): string {
     return `${rows}x${cols}`;
-}
-
-export function getModel(state: LearnerState, rows: number, cols: number): Grid {
-    return state.models[modelKey(rows, cols)] ?? createGrid(rows, cols, 0.5);
-}
-
-export function getArchive(state: LearnerState, rows: number, cols: number): Grid[] {
-    return state.archives[modelKey(rows, cols)] ?? [];
 }
